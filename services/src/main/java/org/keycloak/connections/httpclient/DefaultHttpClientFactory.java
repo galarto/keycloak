@@ -19,9 +19,16 @@ package org.keycloak.connections.httpclient;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.security.KeyStore;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+
+
+import org.apache.http.Header;
+
+import org.apache.http.HttpStatus;
 
 import org.keycloak.Config;
 import org.keycloak.common.util.EnvUtil;
@@ -45,6 +52,9 @@ import org.apache.http.impl.client.CloseableHttpClient;
 import org.apache.http.util.EntityUtils;
 import org.jboss.logging.Logger;
 
+import org.keycloak.utils.SSRFProtectionUtils;
+
+import static org.keycloak.config.HttpOptions.ClientAuth.request;
 import static org.keycloak.utils.StringUtil.isBlank;
 
 /**
@@ -74,6 +84,10 @@ public class DefaultHttpClientFactory implements HttpClientFactory {
 
     private final InputStreamResponseHandler inputStreamResponseHandler = new InputStreamResponseHandler();
     private long maxConsumedResponseSize;
+    private boolean ssrfProtectionEnabled;
+    private boolean blockRedirects;
+    private boolean blockInternalRequests;
+
 
     private static class InputStreamResponseHandler extends AbstractResponseHandler<InputStream> {
 
@@ -99,6 +113,47 @@ public class DefaultHttpClientFactory implements HttpClientFactory {
             }
 
             @Override
+            public InputStream getInputStream(String uri) throws IOException {
+                String currentUri = uri;
+
+                while (true) {
+                    HttpGet request = new HttpGet(uri);
+
+                    try (CloseableHttpResponse response = httpClient.execute(request)) {
+                        int statusCode = response.getStatusLine().getStatusCode();
+
+                        if (statusCode >= HttpStatus.SC_MULTIPLE_CHOICES
+                                && statusCode < HttpStatus.SC_BAD_REQUEST) {
+
+                            Header locationHeader = response.getFirstHeader("Location");
+                            if (locationHeader == null) {
+                                throw new IOException("Redirect status code " + statusCode
+                                        + " received but no Location header found");
+                            }
+
+                            String location = locationHeader.getValue();
+
+                            currentUri = resolveUri(currentUri, location);
+
+                            if (ssrfProtectionEnabled && blockInternalRequests) {
+                                SSRFProtectionUtils.validate(URI.create(currentUri));
+                            }
+
+                            continue;
+                        }
+                        if (statusCode == HttpStatus.SC_OK) {
+                            InputStream body = inputStreamResponseHandler.handleResponse(response);
+                            if (body == null) {
+                                throw new IOException("No content returned from HTTP call");
+                            }
+                            return body;
+                        }
+                        throw new IOException("Unexpected HTTP Status: " + statusCode);
+                    }
+                }
+            }
+
+            @Override
             public void close() {
 
             }
@@ -121,24 +176,56 @@ public class DefaultHttpClientFactory implements HttpClientFactory {
 
             @Override
             public String getString(String uri) throws IOException {
-                HttpGet request = new HttpGet(uri);
-                HttpResponse response = httpClient.execute(request);
-                String body = stringResponseHandler.handleResponse(response);
-                if (body == null) {
-                    throw new IOException("No content returned from HTTP call");
+                String currentUri = uri;
+                while (true) {
+                    if (ssrfProtectionEnabled && blockInternalRequests) {
+                        SSRFProtectionUtils.validate(URI.create(uri));
+                    }
+                    HttpGet request = new HttpGet(uri);
+
+                    try (CloseableHttpResponse response = httpClient.execute(request)) {
+                        int statusCode = response.getStatusLine().getStatusCode();
+
+                        if (statusCode >= HttpStatus.SC_MULTIPLE_CHOICES
+                                && statusCode < HttpStatus.SC_BAD_REQUEST) {
+
+                            Header locationHeader = response.getFirstHeader("Location");
+                            if (locationHeader == null) {
+                                throw new IOException("Redirect status code " + statusCode
+                                        + " received but no Location header found");
+                            }
+
+                            String location = locationHeader.getValue();
+
+                            currentUri = resolveUri(currentUri, location);
+
+                            if (ssrfProtectionEnabled && blockInternalRequests) {
+                                SSRFProtectionUtils.validate(URI.create(currentUri));
+                            }
+
+                            continue;
+                        }
+                        if (statusCode == HttpStatus.SC_OK) {
+                            String body = stringResponseHandler.handleResponse(response);
+                            if (body == null) {
+                                throw new IOException("No content returned from HTTP call");
+                            }
+                            return body;
+                        }
+
+                        throw new IOException("Unexpected HTTP status: " + statusCode);
+                    }
                 }
-                return body;
             }
 
-            @Override
-            public InputStream getInputStream(String uri) throws IOException {
-                HttpGet request = new HttpGet(uri);
-                HttpResponse response = httpClient.execute(request);
-                InputStream body = inputStreamResponseHandler.handleResponse(response);
-                if (body == null) {
-                    throw new IOException("No content returned from HTTP call");
+            private String resolveUri(String baseUri, String location) throws IOException {
+                try {
+                    URI base = new URI(baseUri);
+                    URI target = base.resolve(location);
+                    return target.toString();
+                } catch (URISyntaxException e) {
+                    throw new IOException("Invalid URI during redirect resolution", e);
                 }
-                return body;
             }
 
             @Override
@@ -189,6 +276,10 @@ public class DefaultHttpClientFactory implements HttpClientFactory {
                     boolean expectContinueEnabled = getBooleanConfigWithSysPropFallback("expect-continue-enabled", false);
                     boolean reuseConnections = getBooleanConfigWithSysPropFallback("reuse-connections", true);
 
+                    ssrfProtectionEnabled = config.getBoolean("ssrf-protection-enabled", true);
+                    blockRedirects = config.getBoolean("ssrf-block-redirects", false);
+                    blockInternalRequests = config.getBoolean("ssrf-block-internal-requests", true);
+
                     // optionally configure proxy mappings
                     // direct SPI config (e.g. via standalone.xml) takes precedence over env vars
                     // lower case env vars take precedence over upper case env vars
@@ -217,7 +308,10 @@ public class DefaultHttpClientFactory implements HttpClientFactory {
                             .disableCookies(disableCookies)
                             .proxyMappings(proxyMappings)
                             .expectContinueEnabled(expectContinueEnabled)
-                            .reuseConnections(reuseConnections);
+                            .reuseConnections(reuseConnections)
+                            .ssrfProtectionEnable(ssrfProtectionEnabled)
+                            .blockRedirects(blockRedirects)
+                            .blockInternalRequests(blockInternalRequests);
 
                     TruststoreProvider truststoreProvider = session.getProvider(TruststoreProvider.class);
                     boolean disableTruststoreProvider = truststoreProvider == null || truststoreProvider.getTruststore() == null;

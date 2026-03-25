@@ -98,6 +98,9 @@ public class HttpClientBuilder {
     protected boolean disableCookies = false;
     protected ProxyMappings proxyMappings;
     protected boolean expectContinueEnabled = false;
+    protected boolean ssrfProtectionEnabled;
+    protected boolean blockRedirects;
+    protected boolean blockInternalRequests;
 
     /**
      * Socket inactivity timeout
@@ -230,6 +233,21 @@ public class HttpClientBuilder {
         return this;
     }
 
+    public HttpClientBuilder ssrfProtectionEnable(boolean ssrfProtectionEnabled) {
+        this.ssrfProtectionEnabled = ssrfProtectionEnabled;
+        return this;
+    }
+
+    public HttpClientBuilder blockRedirects(boolean blockRedirects) {
+        this.blockRedirects = blockRedirects;
+        return this;
+    }
+
+    public HttpClientBuilder blockInternalRequests(boolean blockInternalRequests) {
+        this.blockInternalRequests = blockInternalRequests;
+        return this;
+    }
+
     public CloseableHttpClient build() {
         HostnameVerifier verifier = null;
         switch (policy) {
@@ -266,11 +284,20 @@ public class HttpClientBuilder {
                 sslsf = new SSLConnectionSocketFactory(tlsContext, verifier);
             }
 
-            RequestConfig requestConfig = RequestConfig.custom()
+            RequestConfig requestConfig;
+            RequestConfig.Builder requestConfigBuilder = RequestConfig.custom()
                     .setConnectTimeout((int) TimeUnit.MILLISECONDS.convert(establishConnectionTimeout, establishConnectionTimeoutUnits))
                     .setSocketTimeout((int) TimeUnit.MILLISECONDS.convert(socketTimeout, socketTimeoutUnits))
                     .setConnectionRequestTimeout((int) TimeUnit.MILLISECONDS.convert(connectionRequestTimeout, connectionRequestTimeoutUnits))
-                    .setExpectContinueEnabled(expectContinueEnabled).build();
+                    .setExpectContinueEnabled(expectContinueEnabled);
+
+            if (blockRedirects) {
+                requestConfigBuilder
+                        .setRedirectsEnabled(false)
+                        .setRelativeRedirectsAllowed(false)
+                        .setMaxRedirects(0);
+            }
+            requestConfig = requestConfigBuilder.build();
 
             org.apache.http.impl.client.HttpClientBuilder builder = getApacheHttpClientBuilder()
                     .setDefaultRequestConfig(requestConfig)
